@@ -31,6 +31,17 @@ receiver.router.post("/slack/events", (req, res) => {
   res.status(200).send();
 });
 
+
+(async () => {
+  try {
+    const res = await pool.query('SELECT NOW()');
+    console.log('Connected to DB:', res.rows[0]);
+  } catch (err) {
+    console.error('DB Connection Error:', err);
+  }
+})();
+
+
 // helper: save to DB
 async function saveToDB(channelId, stats) {
   const q = `INSERT INTO daily_stats (channel_id, total_messages, total_reactions, total_users, most_active_user, top_emoji)

@@ -8,6 +8,9 @@ const pool = new Pool({
   database: process.env.PG_DATABASE || 'slackdb',
   password: process.env.PG_PASSWORD || '',
   port: process.env.PG_PORT ? Number(process.env.PG_PORT) : 5432,
+   ssl: {
+    rejectUnauthorized: false, // needed for Render cloud
+  },
 });
 
 async function initDB() {
