@@ -5,18 +5,22 @@ const pool = require('./db');
 const vader = require('vader-sentiment');
 const generateSlackStats = require('./analytics');
 const cron = require('node-cron')
-const fs = require("fs");
+//const fs = require("fs");
 const Sentiment = require("sentiment");
-const emojiSentiment = require("emoji-sentiment");
 const emoji = require("node-emoji");
-// const emojiSentiment =require("emoji-sentiment");
-// const emoji  =require("emoji-dictionary");
-
-// const sentiment = require("sentiment");
-//const emojiSentiment = require("emoji-sentiment");
 const emojiLib = require("emoji-dictionary"); 
 const emojiEmotion = require("emoji-emotion");
-// const fetch = require ("node-fetch");
+const { parse } = require("json2csv");
+
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+const emojiSentiment = require("emoji-sentiment");
+const nodeEmoji = require("node-emoji");
+
+const IAMCAL_URL = "https://raw.githubusercontent.com/iamcal/emoji-data/master/emoji.json";
+
+
 
 
 
@@ -432,6 +436,9 @@ app.shortcut("sentiment_analysis_shortcut", async ({ shortcut, ack, client }) =>
 });
 
 
+
+
+
 // app.shortcut("sentiment_analysis_shortcut", async ({ shortcut, ack, client }) => {
 //   try {
 //     await ack();
@@ -601,6 +608,242 @@ app.shortcut("sentiment_analysis_shortcut", async ({ shortcut, ack, client }) =>
 //       "🟡"
 //   };
 // }
+
+
+// --------------- MESSAGE SHORTCUT ---------------
+app.shortcut("analyze_post", async ({ shortcut, ack, client }) => {
+  await ack();
+
+  const channel = shortcut.channel.id;
+  const message_ts = shortcut.message.ts;
+
+  // 1️⃣ Show LOADING modal immediately
+  const loading = await client.views.open({
+    trigger_id: shortcut.trigger_id,
+    view: {
+      type: "modal",
+      callback_id: "loading_modal",
+      title: { type: "plain_text", text: "Analyzing..." },
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: "*Please wait… fetching message details.*" }
+        }
+      ]
+    }
+  });
+
+  // 2️⃣ Fetch message + reactions
+  const slack_msg_id = `${channel}-${message_ts}`;
+
+  const msgData = await client.conversations.replies({
+    channel,
+    ts: message_ts,
+    limit: 1
+  });
+
+  const msg = msgData.messages[0];
+
+  const reactionData = await client.reactions.get({
+    channel,
+    timestamp: message_ts
+  });
+
+  const reactions = reactionData.message.reactions || [];
+
+  let breakdown = [];
+
+  for (const r of reactions) {
+    const names = [];
+
+    for (const userId of r.users) {
+      const userInfo = await client.users.info({ user: userId });
+      names.push(userInfo.user.real_name);
+    }
+
+    breakdown.push({
+      emoji: r.name,
+      count: r.count,
+      users: names
+    });
+  }
+
+  const analysis = {
+    slack_msg_id,
+    channel_id: channel,
+    channel_name: shortcut.channel.name,
+    posted_by_id: msg.user,
+    posted_by_name: (await client.users.info({ user: msg.user })).user.real_name,
+    text: msg.text,
+    posted_at: new Date(Number(message_ts.split(".")[0]) * 1000),
+    reply_count: msg.reply_count || 0,
+    total_reactions: reactions.reduce((a, r) => a + r.count, 0),
+    unique_reactions: reactions.length,
+    reaction_breakdown: breakdown
+  };
+
+  // 3️⃣ Update DB (same as before)
+  await pool.query(
+    `
+    INSERT INTO post_analysis (
+      slack_msg_id, channel_id, channel_name, posted_by_id, posted_by_name,
+      text, posted_at, reply_count, total_reactions, unique_reactions, reaction_breakdown
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    ON CONFLICT (slack_msg_id)
+    DO UPDATE SET
+      text = EXCLUDED.text,
+      reply_count = EXCLUDED.reply_count,
+      total_reactions = EXCLUDED.total_reactions,
+      unique_reactions = EXCLUDED.unique_reactions,
+      reaction_breakdown = EXCLUDED.reaction_breakdown,
+      updated_at = NOW();
+    `,
+    [
+      analysis.slack_msg_id,
+      analysis.channel_id,
+      analysis.channel_name,
+      analysis.posted_by_id,
+      analysis.posted_by_name,
+      analysis.text,
+      analysis.posted_at,
+      analysis.reply_count,
+      analysis.total_reactions,
+      analysis.unique_reactions,
+      JSON.stringify(analysis.reaction_breakdown)
+    ]
+  );
+
+  // 4️⃣ Replace LOADING modal with FINAL modal
+  await client.views.update({
+    view_id: loading.view.id,
+    view: buildAnalysisModal(analysis)
+  });
+});
+
+
+// ------------------- MODAL LAYOUT -------------------
+
+function buildAnalysisModal(a) {
+  const formattedTime = new Date(a.posted_at).toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).replace(",", " at");
+
+  return {
+    type: "modal",
+    callback_id: "analysis_modal",
+    title: { type: "plain_text", text: "Post Analysis" },
+    close: { type: "plain_text", text: "Close" },
+
+    blocks: [
+      // Channel + User + Time + Message
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text:
+            `*Channel:* <https://dummy|${a.channel_name}>\n` +
+            `*Posted by:* ${a.posted_by_name}\n` +
+            `*Time:* ${formattedTime}\n` +
+            `*Message:* ${a.text}`
+        }
+      },
+
+      { type: "divider" },
+
+      // Thread + Total Reactions
+      {
+        type: "section",
+        fields: [
+          {
+            type: "mrkdwn",
+            text: `*Thread replies*\n${a.reply_count} replies`
+          },
+          {
+            type: "mrkdwn",
+            text: `*Total reactions*\n${a.total_reactions} reactions`
+          }
+        ]
+      },
+
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `*Unique reactions*\n${a.unique_reactions} reactions`
+        }
+      },
+
+      { type: "divider" },
+
+      {
+        type: "section",
+        text: { type: "mrkdwn", text: `*Reaction breakdown*` }
+      },
+
+      ...a.reaction_breakdown.map(r => ({
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `:${r.emoji}: *${r.count} person* — ${r.users.join(", ")}`
+        }
+      })),
+
+      {
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            action_id: "download_csv",
+            style: "primary",   // GREEN BUTTON
+            text: { type: "plain_text", text: "Download CSV" },
+            value: a.slack_msg_id
+          }
+        ]
+      }
+    ]
+  };
+}
+
+
+
+app.action("download_csv", async ({ ack, body, client }) => {
+  await ack();
+
+  const slack_msg_id = body.actions[0].value;
+
+  // 1️⃣ Fetch DB row
+  const result = await pool.query(
+    "SELECT * FROM post_analysis WHERE slack_msg_id=$1",
+    [slack_msg_id]
+  );
+
+  const row = result.rows[0];
+  if (!row) return;
+
+  // 2️⃣ Convert to CSV
+  const csv = parse(row);
+
+  // 3️⃣ Open a DM with the user (files.uploadV2 requires a channel, not a user)
+  const dm = await client.conversations.open({
+    users: body.user.id
+  });
+
+  const dmChannel = dm.channel.id; // <-- This is valid for uploadV2
+
+  // 4️⃣ Upload CSV
+  await client.files.uploadV2({
+    channel_id: dmChannel,
+    filename: "post_analysis.csv", // filetype inferred from extension
+    content: csv
+  });
+});
+
+//---------------------------------------------
+
 
 app.event("message", async ({ event, client }) => {
   try {
@@ -1101,6 +1344,396 @@ app.command("/mood", async ({ ack, say }) => {
     ],
   });
 });
+
+
+
+
+
+// app.shortcut("analyze_emoji_message", async ({ shortcut, ack, client }) => {
+//   await ack();
+
+//   try {
+//     // 1️⃣ Open loading modal
+//     const loadingView = await client.views.open({
+//       trigger_id: shortcut.trigger_id,
+//       view: {
+//         type: "modal",
+//         title: { type: "plain_text", text: "Post Sentiment Analysis" },
+//         close: { type: "plain_text", text: "Close" },
+//         blocks: [
+//           {
+//             type: "section",
+//             text: { type: "mrkdwn", text: "⏳ *Analyzing message, reactions, and thread replies…*" }
+//           }
+//         ]
+//       }
+//     });
+
+//     const channel = shortcut.channel.id;
+//     const message_ts = shortcut.message.ts;
+
+//     // -------------------------------------------------------------
+//     // 2️⃣ Fetch main message and reactions
+//     // -------------------------------------------------------------
+//     const msgData = await client.conversations.history({
+//       channel,
+//       latest: message_ts,
+//       inclusive: true,
+//       limit: 1
+//     });
+
+//     const message = msgData.messages[0];
+//     const reactions = message.reactions || [];
+
+//     // -------------------------------------------------------------
+//     // 3️⃣ Fetch thread replies (if any)
+//     // -------------------------------------------------------------
+//     let threadReplies = [];
+//     if (message.reply_count && message.reply_count > 0) {
+//       const threadData = await client.conversations.replies({
+//         channel,
+//         ts: message_ts
+//       });
+//       threadReplies = threadData.messages.filter(m => m.ts !== message_ts);
+//     }
+
+//     // -------------------------------------------------------------
+//     // 4️⃣ Build emoji sentiment map
+//     // -------------------------------------------------------------
+//     const sentimentMap = new Map();
+//     emojiSentiment.forEach(entry => {
+//       try {
+//         const codepoints = entry.sequence.split("-").map(h => parseInt(h, 16));
+//         const char = String.fromCodePoint(...codepoints);
+//         const score = entry.score ?? entry.sentiment ?? 0;
+//         sentimentMap.set(char, score);
+//       } catch {}
+//     });
+
+//     // -------------------------------------------------------------
+//     // 5️⃣ Calculate emoji sentiment
+//     // -------------------------------------------------------------
+//     let totalEmojiScore = 0;
+//     const emojiDetails = [];
+
+//     for (const r of reactions) {
+//       const unicode = nodeEmoji.get(r.name);
+//       if (!unicode || unicode === `:${r.name}:`) {
+//         emojiDetails.push(`• :${r.name}: → ❓ _Unknown emoji or custom_`);
+//         continue;
+//       }
+//       const score = sentimentMap.get(unicode) || 0;
+//       const total = score * r.count;
+//       totalEmojiScore += total;
+//       emojiDetails.push(`• ${unicode} *:${r.name}:* → score *${score.toFixed(2)}* × ${r.count} = *${total.toFixed(2)}*`);
+//     }
+
+//     // -------------------------------------------------------------
+//     // 6️⃣ Calculate thread reply sentiment
+//     // -------------------------------------------------------------
+//     // const sentiment = require("sentiment")();
+//     let totalThreadScore = 0;
+//     const threadDetails = [];
+
+//     threadReplies.forEach(reply => {
+//       const textScore = sentiment.analyze(reply.text || "").score;
+//       totalThreadScore += textScore;
+//       threadDetails.push(`• <@${reply.user}>: "${reply.text}" → score *${textScore.toFixed(2)}*`);
+//     });
+
+//     // Weighted combined score
+//     const totalScore = totalEmojiScore + totalThreadScore;
+
+//     // Classification
+//     let label = "Neutral";
+//     let labelEmoji = "🟡";
+//     if (totalScore > 0.3) { label = "Positive"; labelEmoji = "🟢"; }
+//     else if (totalScore < -0.3) { label = "Negative"; labelEmoji = "🔴"; }
+
+//     // Format date
+//     const tsFloat = parseFloat(message.ts) * 1000;
+//     const date = new Date(tsFloat);
+//     const options = { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "numeric" };
+//     const formattedDate = date.toLocaleString("en-US", options);
+
+//     // -------------------------------------------------------------
+//     // 7️⃣ Build modal blocks
+//     // -------------------------------------------------------------
+//     const modalBlocks = [
+//       {
+//         type: "section",
+//         text: {
+//           type: "mrkdwn",
+//           text: `*Message Sentiment Analysis* ${labelEmoji}\n` +
+//                 `*Channel:* <#${channel}>\n` +
+//                 `*Posted by:* <@${message.user}>\n` +
+//                 `*Date:* ${formattedDate}\n\n` +
+//                 `*Overall Score:* ${totalScore.toFixed(2)} → *${label}*\n` +
+//                 `*Total Reactions:* ${reactions.reduce((a,b)=>a+b.count,0)}\n` +
+//                 `*Unique Reactions:* ${reactions.length}\n` +
+//                 `*Thread Replies:* ${threadReplies.length}`
+//         }
+//       },
+//       { type: "divider" },
+//       {
+//         type: "section",
+//         text: {
+//           type: "mrkdwn",
+//           text: "*Emoji Reactions*\n" + (emojiDetails.length > 0 ? emojiDetails.join("\n") : "_No emoji reactions_")
+//         }
+//       }
+//     ];
+
+//     if (threadDetails.length > 0) {
+//       modalBlocks.push({ type: "divider" });
+//       modalBlocks.push({
+//         type: "section",
+//         text: { type: "mrkdwn", text: "*Thread Replies Sentiment*\n" + threadDetails.join("\n") }
+//       });
+//     }
+
+//     // -------------------------------------------------------------
+//     // 8️⃣ Show final modal
+//     // -------------------------------------------------------------
+//     await client.views.update({
+//       view_id: loadingView.view.id,
+//       view: {
+//         type: "modal",
+//         title: { type: "plain_text", text: "Post Sentiment Analysis" },
+//         close: { type: "plain_text", text: "Close" },
+//         blocks: modalBlocks
+//       }
+//     });
+
+//   } catch (err) {
+//     console.error("Sentiment error:", err);
+//     await client.views.open({
+//       trigger_id: shortcut.trigger_id,
+//       view: {
+//         type: "modal",
+//         title: { type: "plain_text", text: "Error" },
+//         close: { type: "plain_text", text: "Close" },
+//         blocks: [
+//           { type: "section", text: { type: "mrkdwn", text: "*Failed to analyze message.*\n" + err.message } }
+//         ]
+//       }
+//     });
+//   }
+// });
+
+
+app.shortcut("analyze_emoji_message", async ({ shortcut, ack, client }) => {
+  await ack();
+
+  try {
+    // 1️⃣ Open loading modal
+    const loadingView = await client.views.open({
+      trigger_id: shortcut.trigger_id,
+      view: {
+        type: "modal",
+        title: { type: "plain_text", text: "Post Sentiment Analysis" },
+        close: { type: "plain_text", text: "Close" },
+        blocks: [
+          { type: "section", text: { type: "mrkdwn", text: "⏳ *Analyzing message, reactions, and thread replies…*" } }
+        ]
+      }
+    });
+
+    const channel = shortcut.channel.id;
+    const message_ts = shortcut.message.ts;
+
+    // 2️⃣ Fetch main message + reactions
+    const msgData = await client.conversations.history({
+      channel,
+      latest: message_ts,
+      inclusive: true,
+      limit: 1
+    });
+    const message = msgData.messages[0];
+    const reactions = message.reactions || [];
+
+    // 3️⃣ Fetch thread replies
+    let threadReplies = [];
+    if (message.reply_count && message.reply_count > 0) {
+      const threadData = await client.conversations.replies({ channel, ts: message_ts });
+      threadReplies = threadData.messages.filter(m => m.ts !== message_ts);
+    }
+
+    // 4️⃣ Emoji sentiment map
+    const sentimentMap = new Map();
+    emojiSentiment.forEach(entry => {
+      try {
+        const codepoints = entry.sequence.split("-").map(h => parseInt(h, 16));
+        const char = String.fromCodePoint(...codepoints);
+        const score = entry.score ?? entry.sentiment ?? 0;
+        sentimentMap.set(char, score);
+      } catch {}
+    });
+
+    // 5️⃣ Calculate emoji sentiment
+    let totalEmojiScore = 0;
+    const emojiDetails = [];
+    reactions.forEach(r => {
+      const unicode = nodeEmoji.get(r.name);
+      if (!unicode || unicode === `:${r.name}:`) {
+        emojiDetails.push(`• :${r.name}: → ❓ _Unknown emoji or custom_`);
+        return;
+      }
+      const score = sentimentMap.get(unicode) || 0;1111
+      const total = score * r.count;
+      totalEmojiScore += total;
+      emojiDetails.push(`• *:${r.name}:* → score *${score.toFixed(2)}* × ${r.count} = *${total.toFixed(2)}*`);
+    });
+
+    // 6️⃣ Thread reply sentiment
+    let totalThreadScore = 0;
+    const threadDetails = [];
+    threadReplies.forEach(reply => {
+      const textScore = sentiment.analyze(reply.text || "").score;
+      totalThreadScore += textScore;
+      threadDetails.push(`• <@${reply.user}>: "${reply.text}" → score *${textScore.toFixed(2)}*`);
+    });
+
+    // 7️⃣ Overall score & classification
+    const totalScore = totalEmojiScore + totalThreadScore;
+    let label = "Neutral", labelEmoji = "🟡";
+    if (totalScore > 0.3) { label = "Positive"; labelEmoji = "🟢"; }
+    else if (totalScore < -0.3) { label = "Negative"; labelEmoji = "🔴"; }
+
+    const tsFloat = parseFloat(message.ts) * 1000;
+    const formattedDate = new Date(tsFloat).toLocaleString("en-US", { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "numeric" });
+
+    // 8️⃣ Upsert record in DB
+    const reactionJSON = reactions.map(r => ({ name: r.name, count: r.count }));
+    const threadJSON = threadReplies.map(r => ({ user: r.user, text: r.text, ts: r.ts }));
+
+    await pool.query(`
+  INSERT INTO post_sentimnet_analysis(
+    slack_msg_id, channel_id, channel_name, posted_by_id, posted_by_name, text, posted_at,
+    reply_count, total_reactions, unique_reactions, reaction_breakdown, thread_breakdown,
+    emoji_score, thread_score, overall_score, overall_label
+  )
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+  ON CONFLICT(slack_msg_id) DO UPDATE SET
+    channel_id=EXCLUDED.channel_id,
+    channel_name=EXCLUDED.channel_name,
+    posted_by_id=EXCLUDED.posted_by_id,
+    posted_by_name=EXCLUDED.posted_by_name,
+    text=EXCLUDED.text,
+    posted_at=EXCLUDED.posted_at,
+    reply_count=EXCLUDED.reply_count,
+    total_reactions=EXCLUDED.total_reactions,
+    unique_reactions=EXCLUDED.unique_reactions,
+    reaction_breakdown=EXCLUDED.reaction_breakdown,
+    thread_breakdown=EXCLUDED.thread_breakdown,
+    emoji_score=EXCLUDED.emoji_score,
+    thread_score=EXCLUDED.thread_score,
+    overall_score=EXCLUDED.overall_score,
+    overall_label=EXCLUDED.overall_label,
+    updated_at=NOW();
+`, [
+  message.ts,
+  channel,
+  message.channel,
+  message.user,
+  message.user,
+  message.text,
+  new Date(tsFloat),
+  threadReplies.length,
+  reactions.reduce((a,b)=>a+b.count,0),
+  reactions.length,
+  JSON.stringify(reactionJSON),
+  JSON.stringify(threadJSON),
+  totalEmojiScore,
+  totalThreadScore,
+  totalScore,
+  label
+]);
+
+
+    // 9️⃣ Build modal blocks with CSV download button
+    // const modalBlocks = [
+    //   { type: "section", text: { type: "mrkdwn",
+    //     text: `*Message Sentiment Analysis* ${labelEmoji}\n*Channel:* <#${channel}>\n*Posted by:* <@${message.user}>\n*Date:* ${formattedDate}\n*Overall Score:* ${totalScore.toFixed(2)} → *${label}*\n*Total Reactions:* ${reactions.reduce((a,b)=>a+b.count,0)}\n*Unique Reactions:* ${reactions.length}\n*Thread Replies:* ${threadReplies.length}`
+    //   }},
+ 
+    //   { type: "divider" },
+    //   { type: "section", text: { type: "mrkdwn", text: "*Emoji Reactions*\n" + (emojiDetails.length>0?emojiDetails.join("\n"):"_No emoji reactions_") } },
+    // ];
+
+       const modalBlocks = [
+      { type: "section", text: { type: "mrkdwn",
+        text: `*Message Sentiment Analysis* ${labelEmoji}\n*Channel:* <#${channel}>\n*Posted by:* <@${message.user}>\n*Date:* ${formattedDate}\n`
+      }},
+
+      { type: "divider" },
+        { type: "section", text: { type: "mrkdwn",
+      text : `*Overall Score:* ${totalScore.toFixed(2)} → *${label}*\n*Total Reactions:* ${reactions.reduce((a,b)=>a+b.count,0)}\n*Unique Reactions:* ${reactions.length}\n*Thread Replies:* ${threadReplies.length}`
+      }},
+
+ 
+      { type: "divider" },
+      { type: "section", text: { type: "mrkdwn", text: "*Emoji Reactions*\n" + (emojiDetails.length>0?emojiDetails.join("\n"):"_No emoji reactions_") } },
+    ];
+
+
+
+    if(threadDetails.length>0){
+      modalBlocks.push({ type:"divider" });
+      modalBlocks.push({ type:"section", text:{ type:"mrkdwn", text:"*Thread Replies Sentiment*\n"+threadDetails.join("\n") } });
+    }
+
+    // Add CSV download button
+    modalBlocks.push({ type:"divider" });
+    modalBlocks.push({
+      type:"actions",
+      elements:[{
+        type:"button",
+        text:{ type:"plain_text", text:"Download CSV", emoji:true },
+        style:"primary",
+        value: message.ts,
+        action_id: "post_sentimnet_analysis_download_csv"
+      }]
+    });
+
+    await client.views.update({ view_id: loadingView.view.id, view:{ type:"modal", title:{ type:"plain_text", text:"Post Sentiment Analysis" }, close:{ type:"plain_text", text:"Close" }, blocks: modalBlocks }});
+
+  } catch(err){
+    console.error("Sentiment error:", err);
+    await client.views.open({ trigger_id: shortcut.trigger_id, view: { type:"modal", title:{ type:"plain_text", text:"Error" }, close:{ type:"plain_text", text:"Close" }, blocks:[{ type:"section", text:{ type:"mrkdwn", text:"*Failed to analyze message.*\n"+err.message } }] } });
+  }
+});
+
+
+app.action("post_sentimnet_analysis_download_csv", async ({ ack, body, client }) => {
+  await ack();
+
+  const slack_msg_id = body.actions[0].value;
+
+  // Fetch row from DB
+  const result = await pool.query("SELECT * FROM post_sentimnet_analysis WHERE slack_msg_id=$1", [slack_msg_id]);
+  const row = result.rows[0];
+  if(!row) return;
+
+  // Convert to CSV
+  const csv = parse([row]);
+
+  // Open DM with user
+  const dm = await client.conversations.open({ users: body.user.id });
+  const dmChannel = dm.channel.id;
+
+  // Upload CSV
+  await client.files.uploadV2({
+    channel_id: dmChannel,
+    filename: "post_analysis.csv",
+    content: csv
+  });
+});
+
+
+
+
+
 
 
 app.action(/mood_.*/, async ({ body, ack, say }) => {

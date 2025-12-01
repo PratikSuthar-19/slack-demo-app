@@ -116,15 +116,87 @@ const create = `
   console.log('✅ slack_messages table ready');
 }
 
+async function initPostAnalysis() {
+  const create = `
+    CREATE TABLE IF NOT EXISTS post_analysis (
+    id SERIAL PRIMARY KEY,
+    slack_msg_id TEXT UNIQUE,
+    channel_id TEXT NOT NULL,
+    channel_name TEXT,
+    posted_by_id TEXT,
+    posted_by_name TEXT,
+    text TEXT,
+    posted_at TIMESTAMPTZ,
+    reply_count INT,
+    total_reactions INT,
+    unique_reactions INT,
+    reaction_breakdown JSONB,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+  `;
+  await pool.query(create);
+  console.log('✅ post analysis table ready');
+}
+
+
+async function initPostAnalysis() {
+  const create = `
+    CREATE TABLE IF NOT EXISTS post_sentimnet_analysis (
+      id SERIAL PRIMARY KEY,
+      slack_msg_id TEXT UNIQUE,
+      channel_id TEXT NOT NULL,
+      channel_name TEXT,
+      posted_by_id TEXT,
+      posted_by_name TEXT,
+      text TEXT,
+      posted_at TIMESTAMPTZ,
+      reply_count INT,
+      total_reactions INT,
+      unique_reactions INT,
+      reaction_breakdown JSONB,
+      thread_breakdown JSONB,
+      emoji_score NUMERIC,
+      thread_score NUMERIC,
+      overall_score NUMERIC,
+      overall_label TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `;
+
+  await pool.query(create);
+  console.log('✅ post_sentimnet_analysis table ready');
+}
+
+
+// async function dropPostAnalysisTable() {
+//   const dropQuery = `
+//     DROP TABLE IF EXISTS post_sentimnet_analysis;
+//   `;
+//   try {
+//     await pool.query(dropQuery);
+//     console.log("✅ post_analysis table dropped successfully");
+//   } catch (err) {
+//     console.error("❌ Error dropping post_analysis table:", err);
+//   }
+// }
+
+
+
 // initDB().catch(err => {
 //   console.error('DB init error', err);
 //   process.exit(1);
 // });
 
 async function initDB() {
+  // await dropPostAnalysisTable();
   await initDailyStats();
   await initSlackMessages();
   await initSentimentTable();
+  await initPostAnalysis();
+
+
 }
 
 initDB().catch(err => {

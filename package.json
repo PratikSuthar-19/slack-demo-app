@@ -12,9 +12,13 @@
   "type": "commonjs",
   "dependencies": {
     "@slack/bolt": "^4.6.0",
+    "axios": "^1.13.2",
     "dotenv": "^17.2.3",
+    "emoji-sentiment": "^3.0.2",
     "googleapis": "^166.0.0",
+    "json2csv": "^6.0.0-alpha.2",
     "node-cron": "^4.2.1",
+    "node-emoji": "^2.2.0",
     "pg": "^8.16.3",
     "sentiment": "^5.0.2",
     "vader-sentiment": "^1.1.3"
